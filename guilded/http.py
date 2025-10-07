@@ -401,6 +401,79 @@ class HTTPClientBase:
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         # 5 seconds of leeway
         return expires_at.timestamp() - now.timestamp() <= 5
+    async def refresh_signature(self) -> None:
+        if not self.session:
+            return
+        try:
+            route = Route('GET', '/content/route/cdn-token', override_base=Route.USER_BASE)
+            resp = await self.session.request(route.method, route.url)
+            if resp.status == 200:
+                token = await json_or_text(resp)
+                if isinstance(token, dict):
+                    self.cdn_qs = token.get('token') or self.cdn_qs
+        except Exception:
+            pass
+
+    def _init_bucket_structs(self) -> None:
+        if not hasattr(self, '_buckets'):
+            self._buckets = {}
+        if not hasattr(self, '_bucket_locks'):
+            self._bucket_locks = {}
+
+    def _bucket(self, key: str):
+        self._init_bucket_structs()
+        b = self._buckets.get(key)
+        if not b:
+            b = {'reset_at': None}
+            self._buckets[key] = b
+        return b
+
+    def _bucket_lock(self, key: str):
+        self._init_bucket_structs()
+        lock = self._bucket_locks.get(key)
+        if not lock:
+            lock = asyncio.Lock()
+            self._bucket_locks[key] = lock
+        return lock
+
+    def _set_bucket_cooldown(self, key: str, seconds: float) -> None:
+        try:
+            seconds = float(seconds)
+        except Exception:
+            return
+        if seconds < 0:
+            seconds = 0
+        self._bucket(key)['reset_at'] = asyncio.get_running_loop().time() + seconds
+
+    async def _wait_for_bucket(self, key: str) -> None:
+        b = self._bucket(key)
+        reset_at = b.get('reset_at')
+        if reset_at:
+            delay = reset_at - asyncio.get_running_loop().time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    def _retry_after_from_headers(self, headers: Dict[str, Any]) -> Optional[float]:
+        ra = headers.get('Retry-After') or headers.get('retry-after')
+        if ra is None:
+            return None
+        try:
+            return float(ra)
+        except Exception:
+            return None
+
+    def _default_bucket_key(self, route: "Route", method: str) -> str:
+        return f"{method}:{route.path}"
+
+    def _resolve_bucket_key(self, route: "Route", method: str) -> str:
+        key = self._default_bucket_key(route, method)
+        if route.path.startswith('/channels/') and '/messages' in route.path:
+            parts = route.path.split('/')
+            if len(parts) > 2:
+                ch_id = parts[2]
+                key = f"channel:{ch_id}:messages"
+        return key
+
 
     async def refresh_signature(self):
         """
@@ -579,6 +652,8 @@ class HTTPClient(HTTPClientBase):
         if 'Authorization' in log_headers:
             log_headers['Authorization'] = 'Bearer [removed]'
 
+        bucket_key = self._resolve_bucket_key(route, method)
+        await self._wait_for_bucket(bucket_key)
         response: Optional[aiohttp.ClientResponse] = None
         data: Optional[Union[Dict[str, Any], str]] = None
         for tries in range(5):
@@ -617,14 +692,18 @@ class HTTPClient(HTTPClientBase):
 
             # The request was successful so just return the text/json
             if 300 > response.status >= 200:
+                slowmode_cooldown = response.headers.get('x-slowmode-cooldown')
+                if slowmode_cooldown:
+                    self._set_bucket_cooldown(bucket_key, slowmode_cooldown)
                 return {
                     "headers": response.headers,
                     "data": data
                 } if return_details else data
 
             if response.status == 429:
-                retry_after = response.headers.get('retry-after')
-                retry_after = float(retry_after) if retry_after is not None else (1 + tries * 2)
+                retry_after_header = response.headers.get('retry-after')
+                retry_after = float(retry_after_header) if retry_after_header is not None else (1 + tries * 2)
+                self._set_bucket_cooldown(bucket_key, retry_after)
 
                 log.warning(
                     'Rate limited on %s. Retrying in %s seconds',
