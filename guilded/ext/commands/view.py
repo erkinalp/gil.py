@@ -182,7 +182,8 @@ class StringView:
                     if is_quoted:
                         # if we're quoted then we're expecting a closing quote
                         raise ExpectedClosingQuoteError(close_quote)
-                    # if we aren't then we just let it through
+                    # if we aren't quoted then the trailing backslash is part of the word
+                    result.append('\\')
                     return ''.join(result)
 
                 if next_char in _escaped_quotes:
